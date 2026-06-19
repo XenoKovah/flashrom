@@ -109,6 +109,7 @@ enum dediprog_readmode {
 	READ_MODE_ATMEL45		= 3,
 	READ_MODE_4B_ADDR_FAST		= 4,
 	READ_MODE_4B_ADDR_FAST_0x0C	= 5, /* New protocol only */
+	READ_MODE_QUAD_OUT		= 9, /* Fast Read Quad Output (0x6B); new protocol only */
 };
 
 enum dediprog_writemode {
@@ -155,6 +156,7 @@ struct dediprog_data {
 	int out_endpoint;
 	int firmwareversion;
 	enum dediprog_devtype devicetype;
+	bool quad;	/* use Fast Read Quad Output (0x6B) for bulk reads */
 };
 
 #if defined(LIBUSB_MAJOR) && defined(LIBUSB_MINOR) && defined(LIBUSB_MICRO) && \
@@ -404,8 +406,16 @@ static int prepare_rw_cmd(
 		data_packet[9] = (start >> 24) & 0xff;
 		if (protocol(dp_data) >= PROTOCOL_V3) {
 			if (is_read) {
-				data_packet[10] = 0x00;	/* address length (3 or 4) */
-				data_packet[11] = 0x00;	/* dummy cycle / 2 */
+				if (dedi_spi_cmd == READ_MODE_QUAD_OUT) {
+					/* Fast Read Quad Output: opcode 0x6B, 8 dummy cycles. */
+					data_packet[4]  = 0x6b;
+					data_packet[5]  = 0xff;
+					data_packet[10] = 0x03;	/* 3-byte address */
+					data_packet[11] = 0x04;	/* dummy cycles / 2 (= 8) */
+				} else {
+					data_packet[10] = 0x00;	/* address length (3 or 4) */
+					data_packet[11] = 0x00;	/* dummy cycle / 2 */
+				}
 			} else {
 				/* 16 LSBs and 16 HSBs of page size */
 				/* FIXME: This assumes page size of 256. */
@@ -479,13 +489,20 @@ static int dediprog_spi_bulk_read(struct flashctx *flash, uint8_t *buf, unsigned
 
 	uint8_t data_packet[command_packet_size];
 	unsigned int value, idx;
-	if (prepare_rw_cmd(flash, data_packet, count, READ_MODE_STD, &value, &idx, start, 1))
+	if (prepare_rw_cmd(flash, data_packet, count,
+			   dp_data->quad ? READ_MODE_QUAD_OUT : READ_MODE_STD, &value, &idx, start, 1))
 		return 1;
+
+	/* Quad reads need the programmer switched to 4-bit I/O for the data phase. */
+	if (dp_data->quad && dediprog_write(dp_data->handle, CMD_IO_MODE, 3, 0, NULL, 0) != 0) {
+		msg_perr("Failed to set quad I/O mode!\n");
+		return 1;
+	}
 
 	int ret = dediprog_write(dp_data->handle, CMD_READ, value, idx, data_packet, sizeof(data_packet));
 	if (ret != (int)sizeof(data_packet)) {
 		msg_perr("Command Read SPI Bulk failed, %i %s!\n", ret, libusb_error_name(ret));
-		return 1;
+		goto err_free;
 	}
 
 	/*
@@ -535,6 +552,9 @@ static int dediprog_spi_bulk_read(struct flashctx *flash, uint8_t *buf, unsigned
 	err = 0;
 
 err_free:
+	/* Restore single I/O mode so later single-lane transfers work. */
+	if (dp_data->quad)
+		dediprog_write(dp_data->handle, CMD_IO_MODE, 0, 0, NULL, 0);
 	dediprog_bulk_read_poll(dp_data->usb_ctx, &status, 1);
 	for (i = 0; i < DEDIPROG_ASYNC_TRANSFERS; ++i)
 		if (transfers[i]) libusb_free_transfer(transfers[i]);
@@ -1096,6 +1116,22 @@ static int dediprog_open(int index, struct dediprog_data *dp_data)
 	return 0;
 }
 
+/* Set the flash chip's Quad Enable (QE) bit so it drives IO2/IO3 during quad
+ * reads. Uses the common Winbond-style sequence: WREN, then Write Status
+ * Register-2 (0x31) with QE (S9) = 1. Validated on the W25Q128JW. */
+static int dediprog_enable_quad(struct dediprog_data *dp_data)
+{
+	const uint8_t wren = 0x06;			/* Write Enable */
+	const uint8_t wrsr2[2] = { 0x31, 0x02 };	/* Write Status Register-2, QE=1 */
+
+	if (dediprog_write(dp_data->handle, CMD_TRANSCEIVE, 0, 0, &wren, 1) != 1)
+		return 1;
+	if (dediprog_write(dp_data->handle, CMD_TRANSCEIVE, 0, 0, wrsr2, sizeof(wrsr2)) != (int)sizeof(wrsr2))
+		return 1;
+	default_delay(20 * 1000);	/* tW for the non-volatile status-register write */
+	return 0;
+}
+
 static int dediprog_init(const struct programmer_cfg *cfg)
 {
 	char *param_str;
@@ -1105,6 +1141,7 @@ static int dediprog_init(const struct programmer_cfg *cfg)
 	int found_id;
 	long usedevice = 0;
 	long target = FLASH_TYPE_APPLICATION_FLASH_1;
+	bool quad = false;
 	int i, ret;
 
 	param_str = extract_programmer_param_str(cfg, "spispeed");
@@ -1130,6 +1167,20 @@ static int dediprog_init(const struct programmer_cfg *cfg)
 		if (millivolt < 0)
 			return 1;
 		msg_pinfo("Setting voltage to %i mV\n", millivolt);
+	}
+
+	param_str = extract_programmer_param_str(cfg, "quad");
+	if (param_str) {
+		if (!strcmp(param_str, "on") || !strcmp(param_str, "1"))
+			quad = true;
+		else if (!strcmp(param_str, "off") || !strcmp(param_str, "0"))
+			quad = false;
+		else {
+			msg_perr("Error: Invalid quad value: '%s' (use 'on' or 'off').\n", param_str);
+			free(param_str);
+			return 1;
+		}
+		free(param_str);
 	}
 
 	param_str = extract_programmer_param_str(cfg, "id");
@@ -1228,6 +1279,7 @@ static int dediprog_init(const struct programmer_cfg *cfg)
 	}
 	dp_data->firmwareversion = FIRMWARE_VERSION(0, 0, 0);
 	dp_data->devicetype = DEV_UNKNOWN;
+	dp_data->quad = quad;
 
 	/* Here comes the USB stuff. */
 	ret = libusb_init(&dp_data->usb_ctx);
@@ -1324,6 +1376,21 @@ static int dediprog_init(const struct programmer_cfg *cfg)
 	    dediprog_set_spi_voltage(dp_data->handle, millivolt)) {
 		dediprog_set_leds(LED_ERROR, dp_data);
 		goto init_err_cleanup_exit;
+	}
+
+	/* Quad (QSPI) bulk reads need the V3 protocol and the flash chip's QE bit
+	 * set so it drives IO2/IO3. (Validated on SF600Plus-G2 + W25Q128JW.) */
+	if (dp_data->quad && protocol(dp_data) < PROTOCOL_V3) {
+		msg_pwarn("Quad read needs the V3 protocol (SF600 FW >= 7.x or SF600Plus-G2); using single I/O.\n");
+		dp_data->quad = false;
+	}
+	if (dp_data->quad) {
+		msg_pinfo("Enabling quad (QSPI) read.\n");
+		if (dediprog_enable_quad(dp_data)) {
+			msg_perr("Failed to enable quad mode on the flash chip!\n");
+			dediprog_set_leds(LED_ERROR, dp_data);
+			goto init_err_cleanup_exit;
+		}
 	}
 
 	if ((dp_data->devicetype == DEV_SF100) ||
