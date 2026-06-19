@@ -1099,7 +1099,7 @@ static int dediprog_open(int index, struct dediprog_data *dp_data)
 static int dediprog_init(const struct programmer_cfg *cfg)
 {
 	char *param_str;
-	int spispeed_idx = 1;
+	int spispeed_idx = 0;	/* 24 MHz (index 0): doubled from the previous 12 MHz default */
 	int millivolt = 3500;
 	int id = -1; /* -1 defaults to enumeration order */
 	int found_id;
