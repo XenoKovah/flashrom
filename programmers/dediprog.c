@@ -42,6 +42,7 @@ enum dediprog_devtype {
 	DEV_SF100		= 100,
 	DEV_SF200		= 200,
 	DEV_SF600		= 600,
+	DEV_SF600PLUS_G2	= 601,
 };
 
 enum dediprog_leds {
@@ -189,6 +190,10 @@ static enum protocol protocol(const struct dediprog_data *dp_data)
 			return PROTOCOL_V2;
 		else
 			return PROTOCOL_V3;
+	case DEV_SF600PLUS_G2:
+		/* The SF600Plus-G2 speaks the same V3 wire protocol as a
+		 * current-firmware SF600(Plus). */
+		return PROTOCOL_V3;
 	default:
 		return PROTOCOL_UNKNOWN;
 	}
@@ -778,7 +783,13 @@ static int dediprog_spi_send_command(const struct flashctx *flash,
 	}
 	ret = dediprog_read(dp_data->dediprog_handle, CMD_TRANSCEIVE, value, idx, readarr, readcnt);
 	*/
-	ret = dediprog_read(dp_data->handle, CMD_TRANSCEIVE, 0, 0, readarr, readcnt);
+	/*
+	 * The SF600Plus-G2 wants the "result in" flag (0x1) in wValue on the IN
+	 * transceive too (matches Dediprog's FlashCommand_TransceiveIn for
+	 * new-USB devices); the SF100/SF600 use 0 here.
+	 */
+	ret = dediprog_read(dp_data->handle, CMD_TRANSCEIVE,
+			    dp_data->devicetype == DEV_SF600PLUS_G2 ? 0x1 : 0, 0, readarr, readcnt);
 	if (ret != (int)readcnt) {
 		msg_perr("Receive SPI failed, expected %i, got %i %s!\n", readcnt, ret, libusb_error_name(ret));
 		return 1;
@@ -799,6 +810,21 @@ static int dediprog_check_devicestring(struct dediprog_data *dp_data)
 	}
 	buf[0x10] = '\0';
 	msg_pdbg("Found a %s\n", buf);
+	/*
+	 * The SF600Plus-G2 reports e.g. "SF600PG2. V:01.0" (the 16-byte info
+	 * read truncates its version). Its "SF600" prefix also matches the
+	 * classic SF600 test below, so detect it first. Its version scheme is
+	 * unrelated to the SF100/200/600 feature numbering, but it speaks the
+	 * modern V3 protocol (see protocol()); pin a modern firmware version
+	 * so the version-gated setup paths (SPI clock, LED command form)
+	 * behave as on a current SF600.
+	 */
+	if (memcmp(buf, "SF600PG2", 0x8) == 0) {
+		dp_data->devicetype = DEV_SF600PLUS_G2;
+		dp_data->firmwareversion = FIRMWARE_VERSION(7, 3, 7);
+		return 0;
+	}
+
 	if (memcmp(buf, "SF100", 0x5) == 0)
 		dp_data->devicetype = DEV_SF100;
 	else if (memcmp(buf, "SF200", 0x5) == 0)
@@ -889,7 +915,8 @@ static int dediprog_standalone_mode(const struct dediprog_data *dp_data)
 {
 	int ret;
 
-	if (dp_data->devicetype != DEV_SF600)
+	if (dp_data->devicetype != DEV_SF600 &&
+	    dp_data->devicetype != DEV_SF600PLUS_G2)
 		return 0;
 
 	msg_pdbg2("Disabling standalone mode.\n");
@@ -1279,19 +1306,29 @@ static int dediprog_init(const struct programmer_cfg *cfg)
 	 * dediprog_check_devicestring() has queried the device. */
 	dediprog_set_leds(LED_ALL, dp_data);
 
-	/* Select target/socket, frequency and VCC. */
+	/* Disable standalone mode BEFORE powering the SPI bus. On the
+	 * SF600Plus-G2 a CMD_SET_STANDALONE issued after SET_VCC wedges the SPI
+	 * engine (RDID then returns all 0x00/0xFF); the Windows software always
+	 * disables standalone before setting VCC. Harmless ordering for SF600. */
+	if (dediprog_standalone_mode(dp_data))
+		goto init_err_cleanup_exit;
+
+	/* Select target/socket, I/O mode, frequency and VCC. The SF600Plus-G2
+	 * requires its SPI I/O mode (single I/O, value 0) to be selected before
+	 * any SPI transaction will respond; the SF100/SF600 do not implement the
+	 * CMD_IO_MODE command. */
 	if (set_target_flash(dp_data->handle, target) ||
+	    (dp_data->devicetype == DEV_SF600PLUS_G2 &&
+	     dediprog_write(dp_data->handle, CMD_IO_MODE, 0, 0, NULL, 0) != 0) ||
 	    dediprog_set_spi_speed(spispeed_idx, dp_data) ||
 	    dediprog_set_spi_voltage(dp_data->handle, millivolt)) {
 		dediprog_set_leds(LED_ERROR, dp_data);
 		goto init_err_cleanup_exit;
 	}
 
-	if (dediprog_standalone_mode(dp_data))
-		goto init_err_cleanup_exit;
-
 	if ((dp_data->devicetype == DEV_SF100) ||
-	    (dp_data->devicetype == DEV_SF600 && protocol(dp_data) == PROTOCOL_V3))
+	    (dp_data->devicetype == DEV_SF600 && protocol(dp_data) == PROTOCOL_V3) ||
+	    (dp_data->devicetype == DEV_SF600PLUS_G2))
 		spi_master_dediprog.features &= ~SPI_MASTER_NO_4BA_MODES;
 
 	if (protocol(dp_data) >= PROTOCOL_V2)
