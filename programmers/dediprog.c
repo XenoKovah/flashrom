@@ -417,6 +417,10 @@ static int prepare_rw_cmd(
 					data_packet[11] = 0x00;	/* dummy cycle / 2 */
 				}
 			} else {
+				/* Quad Input Page Program (0x32): the data phase is on
+				 * 4 lanes; command/address stay single. */
+				if (dp_data->quad && dedi_spi_cmd == WRITE_MODE_PAGE_PGM)
+					data_packet[4] = 0x32;
 				/* 16 LSBs and 16 HSBs of page size */
 				/* FIXME: This assumes page size of 256. */
 				data_packet[10] = 0x00;
@@ -660,9 +664,22 @@ static int dediprog_spi_bulk_write(struct flashctx *flash, const uint8_t *buf, u
 	unsigned int value, idx;
 	if (prepare_rw_cmd(flash, data_packet, count, dedi_spi_cmd, &value, &idx, start, 0))
 		return 1;
+
+	/* Quad Input Page Program: switch the programmer to 4-bit I/O for the data phase. */
+	const bool quad_write = dp_data->quad && dedi_spi_cmd == WRITE_MODE_PAGE_PGM;
+	if (quad_write) {
+		msg_pdbg("Quad page program (0x32): %u pages at 0x%06x\n", count, start);
+		if (dediprog_write(dp_data->handle, CMD_IO_MODE, 3, 0, NULL, 0) != 0) {
+			msg_perr("Failed to set quad I/O mode!\n");
+			return 1;
+		}
+	}
+
 	int ret = dediprog_write(dp_data->handle, CMD_WRITE, value, idx, data_packet, sizeof(data_packet));
 	if (ret != (int)sizeof(data_packet)) {
 		msg_perr("Command Write SPI Bulk failed, %s!\n", libusb_error_name(ret));
+		if (quad_write)
+			dediprog_write(dp_data->handle, CMD_IO_MODE, 0, 0, NULL, 0);
 		return 1;
 	}
 
@@ -676,11 +693,15 @@ static int dediprog_spi_bulk_write(struct flashctx *flash, const uint8_t *buf, u
 					   DEFAULT_TIMEOUT);
 		if ((ret < 0) || (transferred != 512)) {
 			msg_perr("SPI bulk write failed, expected %i, got %s!\n", 512, libusb_error_name(ret));
+			if (quad_write)
+				dediprog_write(dp_data->handle, CMD_IO_MODE, 0, 0, NULL, 0);
 			return 1;
 		}
 		update_progress(flash, FLASHROM_PROGRESS_WRITE, chunksize);
 	}
 
+	if (quad_write)
+		dediprog_write(dp_data->handle, CMD_IO_MODE, 0, 0, NULL, 0);
 	return 0;
 }
 
